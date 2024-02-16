@@ -1,117 +1,104 @@
 package file
 
 import (
-	"errors"
 	"io"
-	"log"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
+	"sync"
 )
 
 type Manager struct {
-	dirname   string
-	blockSize int
-	openFiles map[string]*os.File
+	dbDirectory string
+	blockSize   int
+	isNew       bool
+	openFiles   map[string]*os.File
+	sync.Mutex
 }
 
-func NewManager(dirname string, blockSize int) (*Manager, error) {
-	if blockSize < 0 {
-		return nil, errors.New("file.Manager: NewManager: block size must be greater than 0")
-	}
-	if len(dirname) <= 0 {
-		return nil, errors.New("file.Manager: NewManager: invalid filename")
-	}
+func NewManager(dbDirectory string, blockSize int) *Manager {
+	_, err := os.Stat(dbDirectory)
+	isNew := os.IsNotExist(err)
 
-	// create directory if not exists
-	if _, err := os.Stat(dirname); os.IsNotExist(err) {
-		if err := os.Mkdir(dirname, os.ModePerm); err != nil {
-			log.Fatal(err)
+	if isNew {
+		err := os.MkdirAll(dbDirectory, os.ModePerm)
+		if err != nil {
+			panic(err)
 		}
 	}
 
-	// delete temp files
-	files, err := os.ReadDir(dirname)
+	entries, err := os.ReadDir(dbDirectory)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-	for _, file := range files {
-		if strings.HasPrefix(file.Name(), "temp") {
-			filepath := filepath.Join(dirname, file.Name())
-			if err := os.Remove(filepath); err != nil {
-				log.Fatal(err)
-			}
+
+	for _, v := range entries {
+		if strings.HasPrefix(v.Name(), "tmp") {
+			os.Remove(v.Name())
 		}
 	}
 
 	return &Manager{
-		dirname:   dirname,
-		blockSize: blockSize,
-		openFiles: make(map[string]*os.File),
-	}, nil
-}
-
-// Write writes the contents of page into block.
-func (fm *Manager) Write(b *BlockId, page *Page) {
-	f := fm.getFile(b.filename)
-	f.Seek(int64(b.blknum*fm.blockSize), io.SeekStart)
-	f.Write(page.Contents())
-}
-
-// Read reads the contents of block into page.
-func (fm *Manager) Read(b *BlockId, page *Page) {
-	f := fm.getFile(b.filename)
-	buf := make([]byte, fm.blockSize)
-	f.Seek(int64((b.blknum)*fm.blockSize), io.SeekStart)
-	f.Read(buf)
-	page.setBytes(0, buf)
-}
-
-// Append a new block to the file.
-func (fm *Manager) Append(filename string) *BlockId {
-	newBlkNum := fm.CountBlocks(filename)
-	blk := NewBlockId(filename, newBlkNum)
-	b := make([]byte, fm.blockSize)
-
-	f := fm.getFile(blk.filename)
-	_, err := f.Seek(int64((blk.blknum)*fm.blockSize), io.SeekStart)
-	if err != nil {
-		log.Fatal("file.Manager: Append: %w", err)
+		dbDirectory: dbDirectory,
+		blockSize:   blockSize,
+		isNew:       isNew,
+		openFiles:   make(map[string]*os.File),
 	}
-	_, err = f.Write(b)
-	if err != nil {
-		log.Fatal("file.Manager: Append: %w", err)
-	}
-	return blk
 }
 
-// Count blocks in the file.
-func (fm *Manager) CountBlocks(filename string) int {
-	f := fm.getFile(filename)
-	fi, err := f.Stat()
-	if err != nil {
-		log.Fatal("Cannot get file information: ", filename)
-	}
-	return int(fi.Size()) / fm.blockSize
+func (manager *Manager) BlockSize() int {
+	return manager.blockSize
 }
 
-func (fm *Manager) BlockSize() int { return fm.blockSize }
+func (manager *Manager) Read(blockID BlockID, page *Page) {
+	manager.Lock()
+	defer manager.Unlock()
 
-// ファイルを取得
-// 存在しなければ作成する
-func (fm *Manager) getFile(filename string) *os.File {
-	f := fm.openFiles[filename]
-	if f != nil {
-		return f
+	f := manager.getFile(blockID.FileName())
+
+	if _, err := f.ReadAt(page.contents(), int64(blockID.BlkNum())*int64(manager.blockSize)); err != io.EOF && err != nil {
+		panic(err)
 	}
+}
 
-	filepath := filepath.Join(fm.dirname, filename)
-	f, err := os.OpenFile(filepath, os.O_RDWR, 0755)
-	if os.IsNotExist(err) {
-		if f, err = os.Create(filepath); err != nil {
-			log.Fatal(err)
+func (manager *Manager) Write(blockID BlockID, p *Page) {
+	manager.Lock()
+	defer manager.Unlock()
+
+	f := manager.getFile(blockID.fileName)
+	f.WriteAt(p.contents(), int64(blockID.blkNum)*int64(manager.blockSize))
+}
+
+func (manager *Manager) getFile(fileName string) *os.File {
+	f, ok := manager.openFiles[fileName]
+	if !ok {
+		p := path.Join(manager.dbDirectory, fileName)
+		table, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR|os.O_SYNC, 0755)
+		if err != nil {
+			panic(err)
 		}
+		manager.openFiles[fileName] = table
+		return table
 	}
-	fm.openFiles[filename] = f
 	return f
+}
+
+func (manager *Manager) Size(fileName string) int {
+	f := manager.getFile(fileName)
+	finfo, err := f.Stat()
+	if err != nil {
+		panic(err)
+	}
+	return int(finfo.Size() / int64(manager.blockSize))
+}
+
+func (manager *Manager) Append(fileName string) BlockID {
+
+	newBlkNum := manager.Size(fileName)
+	block := NewBlockID(fileName, newBlkNum)
+	buf := make([]byte, manager.blockSize)
+
+	f := manager.getFile(fileName)
+	f.WriteAt(buf, int64(block.blkNum)*int64(manager.blockSize))
+	return block
 }

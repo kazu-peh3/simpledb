@@ -1,0 +1,96 @@
+package buffer
+
+import (
+	"github.com/kazu-peh3/simpledb/file"
+	"github.com/kazu-peh3/simpledb/log"
+)
+
+// A Buffer stores pages status information, such as if it's pinned
+// and if that's the case, what block it is assigned to.
+// Each buffer observes the changes done to its page and it is responsible
+// for writing its modifications to disk.
+// A Buffer can reduce disk access by delaying flushing:
+// for example, if a page is modified several times , then it is more
+// efficient to write the page once, after all modifications.
+// The Buffer will flush its underlying page only in case the page is
+// assigned to a different block, or if the recovery manager needs to write to disk to guard agains a crash.
+type Buffer struct {
+	fm       *file.Mgr
+	lm       *log.LogMgr
+	contents *file.Page
+	block    file.BlockID
+	// how many pins
+	// todo: can use an atomic int to leverage CAS
+	pins  int
+	txnum int
+	// log sequence number
+	lsn int
+}
+
+func NewBuffer(fm *file.Mgr, lm *log.LogMgr) *Buffer {
+	return &Buffer{
+		fm:       fm,
+		lm:       lm,
+		contents: file.NewPageWithSize(fm.BlockSize()),
+		txnum:    -1,
+		lsn:      -1,
+	}
+}
+
+func (buf *Buffer) Contents() *file.Page {
+	return buf.contents
+}
+
+func (buf *Buffer) BlockID() file.BlockID {
+	return buf.block
+}
+
+func (buf *Buffer) SetModified(txnum int, lsn int) {
+	buf.txnum = txnum
+	if lsn >= 0 {
+		buf.lsn = lsn
+	}
+}
+
+func (buf *Buffer) ModifyingTx() int {
+	return buf.txnum
+}
+
+func (buf *Buffer) IsPinned() bool {
+	return buf.pins > 0
+}
+
+// flush ensures that the buffer's assigned disk block has the same values as its page.
+// If the underlying page has not been modified (txnum = 0), nothing is written to disk
+// otherwise, ensures that the current log is flushed to disk if needed
+// and then writes the page to disk.
+func (buf *Buffer) flush() {
+	if buf.txnum > 0 {
+		// flush the log to current block
+		buf.lm.Flush(buf.lsn)
+		// persist contents of the buffer to the assigned block
+		buf.fm.Write(buf.block, buf.contents)
+		buf.txnum = -1
+	}
+}
+
+// assignToBlock associates a buffer with a disk block.
+// The buffer is first flushed so that any modifications to the
+// previous block are prserved.
+// The buffer is then associated with the specified block, reading its contents from disk.
+func (buf *Buffer) assignToBlock(block file.BlockID) {
+	// flush current contents
+	buf.flush()
+	buf.block = block
+	// reads the block into the buffer page
+	buf.fm.Read(buf.block, buf.contents)
+	buf.pins = 0
+}
+
+func (buf *Buffer) pin() {
+	buf.pins++
+}
+
+func (buf *Buffer) unpin() {
+	buf.pins--
+}
